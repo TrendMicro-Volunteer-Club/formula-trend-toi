@@ -1,2 +1,2 @@
-# formula_trend_toi
-Trend Micro Formula Trend transfer of information documents repository, for volunteer clubs
+# Trend Micro Formula Trend Transfer of Information
+Repositorty for sample code, documents, simulator, and firmware of Formula Trend.
