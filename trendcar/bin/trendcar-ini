@@ -1,0 +1,53 @@
+#!/bin/sh
+
+_realpath () {
+	hash realpath >/dev/null 2>&1 && realpath "$1" && return;
+	[ -L "$1" ] && readlink "$1" && return;
+	echo "$1"
+}
+SCRIPT_BASE=$(cd $(dirname $(_realpath $0)); pwd)
+
+. "${SCRIPT_BASE}"/functions.inc
+
+if [ $# -lt 3 ]; then
+	echo "$(basename $0) get <section> <key>"
+	echo "$(basename $0) set <section> <key> <value>"
+	echo "$(basename $0) setuser <section> <key> <value>"
+	exit 1;
+fi
+
+action="$1"
+
+if [ "${action}" = "get" ]; then
+	if [ $# -gt 3 ]; then
+		echo "Too many arguments";
+		exit 1;
+	fi
+elif [ "${action}" = "set" ]; then
+	if [ $# -lt 4 ]; then
+		echo "Too few arguments";
+		exit 1;
+	elif [ $# -gt 4 ]; then
+		echo "Too many arguments";
+		exit 1;
+	fi
+elif [ "${action}" = "setuser" ]; then
+	if [ $# -lt 4 ]; then
+		echo "Too few arguments";
+		exit 1;
+	elif [ $# -gt 4 ]; then
+		echo "Too many arguments";
+		exit 1;
+	fi
+else
+	echo "Unknown action: ${action}";
+	exit 1;
+fi
+
+${PYTHON} "${TRENDCAR_HOME}/trendcar/common/config.py" "${TRENDCAR_HOME}/trendcar/config.ini" $*
+
+if running_in_pi; then
+	sync; sync; sync
+	echo 3 > /proc/sys/vm/drop_caches
+fi
+

@@ -1,0 +1,35 @@
+#!/bin/sh
+
+_realpath () {
+	hash realpath >/dev/null 2>&1 && realpath "$1" && return;
+	[ -L "$1" ] && readlink "$1" && return;
+	echo "$1"
+}
+SCRIPT_BASE=$(cd $(dirname $(_realpath $0)); pwd)
+
+. "${SCRIPT_BASE}"/functions.inc
+
+if running_in_pi; then
+	if [ $(id -u) -ne 0 ]; then
+		exec sudo sh $0 "$@";
+		exit 1;
+	fi
+
+	trap "terminate_trendcar" HUP INT TERM KILL EXIT
+
+	fix_udev_mounts
+
+	echo "Using ${PYTHON} to launch TrendCar daemon..."
+	${PYTHON} "${TRENDCAR_HOME}/trendcar/trendcar.py" --daemon $* &
+	PID=$!
+
+	if write_trendcar_pid "${PID}"; then
+		wait_trendcar_pid
+	else
+		wait ${PID}
+	fi
+else
+	echo "Using ${PYTHON} to launch TrendCar daemon..."
+	${PYTHON} "${TRENDCAR_HOME}/trendcar/trendcar.py" --daemon $*
+fi
+

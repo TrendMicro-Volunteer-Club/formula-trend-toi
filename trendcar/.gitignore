@@ -1,0 +1,5 @@
+.*.sw?
+*.bak
+*.pyc
+*.tmp
+/build

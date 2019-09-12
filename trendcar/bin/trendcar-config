@@ -1,0 +1,1556 @@
+#!/bin/sh
+
+if [ ! -e "/sys/firmware/devicetree/base/model" ]; then
+	echo "This command can only be executed in Raspberry Pi";
+	exit 1;
+fi
+
+init_term_sizes ()
+{
+	TERM_HEIGHT=17
+	TERM_WIDTH=$(tput cols)
+
+	if [ -z "${TERM_WIDTH}" ] || [ "${TERM_WIDTH}" -lt 60 ]; then
+		TERM_WIDTH=80
+	fi
+	if [ "${TERM_WIDTH}" -gt 178 ]; then
+		TERM_WIDTH=120
+	fi
+	MENU_HEIGHT=$((${TERM_HEIGHT} - 7))
+}
+
+get_pi_model_name ()
+{
+	cat /proc/device-tree/model
+}
+
+sync_disk ()
+{
+	sync; sync; sync;
+	echo 3 > /proc/sys/vm/drop_caches
+}
+
+update_identity_txt ()
+{
+	local IDENTITY_TXT="/boot/identity.txt"
+	local key="$1"
+	local value="$2"
+
+	if [ -f "${IDENTITY_TXT}" ]; then
+		if grep -q "\s*@${key}\s*=" "${IDENTITY_TXT}"; then
+			sed -i -e "s/^[[:space:]]*\(@${key}\)[[:space:]]*=.*$/\1=${value}/" "${IDENTITY_TXT}"
+		else
+			echo "@${key}=${value}" >> "${IDENTITY_TXT}"
+		fi
+		sync_disk
+	fi
+}
+
+UI_DISABLED=0
+
+whiptail ()
+{
+	if [ ${UI_DISABLED} -eq 0 ]; then
+		/usr/bin/whiptail "$@"
+	else
+		if [ "$1" = "--msgbox" ]; then
+			shift;
+			while [ ! -z "$1" ]; do
+				case "$1" in
+					--*) shift; ;;
+					  *) echo "$1"; break; ;;
+				esac
+			done
+		else
+			exit 1;
+		fi
+	fi
+}
+
+noui ()
+{
+	UI_DISABLED=1
+}
+
+select_menu_item ()
+{
+	local TITLE="$1"; shift;
+	local SUBTITLE="$1"; shift;
+	local OK_BUTTON="$1"; shift;
+	local CANCEL_BUTTON="$1"; shift;
+	local DEFAULT_ITEM="$1"; shift;
+	local CHOICE="$(whiptail --title "${TITLE}" \
+		--backtitle "Trend Car running on $(get_pi_model_name)" \
+		--menu "${SUBTITLE}" ${TERM_HEIGHT} ${TERM_WIDTH} ${MENU_HEIGHT} --default-item "${DEFAULT_ITEM}" \
+		--ok-button     "${OK_BUTTON}" \
+		--cancel-button "${CANCEL_BUTTON}" "$@" 3>&1 1>&2 2>&3)"
+	echo -n "${CHOICE}"
+}
+
+msgbox ()
+{
+	whiptail --msgbox "$@" 20 60 1 3>&1 1>&2 2>&3
+}
+
+passwordbox ()
+{
+	local MESSAGE="$1";
+	local DEFAULT="$2";
+	whiptail --passwordbox "${MESSAGE}" 20 60 "${DEFAULT}" 3>&1 1>&2 2>&3
+}
+
+inputbox ()
+{
+	local MESSAGE="$1";
+	local DEFAULT="$2";
+	whiptail --inputbox "${MESSAGE}" 20 60 "${DEFAULT}" 3>&1 1>&2 2>&3
+}
+
+##################################################################################
+list_wifi_iface ()
+{
+	for dir in /sys/class/net/*/wireless; do
+		if [ -d "${dir}" ]; then
+			basename "$(dirname "${dir}")"
+		fi
+	done
+}
+
+get_wifi_status ()
+{
+	local wlan="$1"
+	wpa_cli -i "${wlan}" status | unescape_hexchars
+}
+
+get_wifi_ssid ()
+{
+	local wlan="$1"
+	get_wifi_status "${wlan}" | awk -F= '$1 == "ssid" {print $2; quit}'
+}
+
+# SSID can consist of up to 32 alphanumeric, case-sensitive characters.
+# The first character cannot be one of the characters: !, #, or ; 
+# SSID cannot ends with any of the characters: +, ], /, ", TAB, spaces
+normalize_ssid ()
+{
+	local ssid="$1"
+	echo "${ssid}" | awk '{
+		$0 = substr($0, 1, 32);
+		sub(/^[!#;]+/, "", $0);
+		sub(/[\+\]\/\"\t ]+$/, "", $0);
+		print $0;
+	}'
+}
+
+unescape_hexchars ()
+{
+	awk '{
+		while (match($0, /\\x[0-9a-fA-F][0-9a-fA-F]/)) {
+			h  = substr($0, RSTART + 1, RLENGTH - 1);
+			c  = sprintf("%c", int("0" h));
+			$0 = substr($0, 1, RSTART - 1) c substr($0, RSTART + RLENGTH)
+		}
+		print $0;
+	}'
+}
+
+escape_nonascii ()
+{
+	awk '
+	BEGIN {
+		for (i = 0; i < 256; i++) {
+			ord[sprintf("%c", i)] = i;
+		}
+	}
+	{
+		for (i = 1; i <= length($0); ) {
+			c = substr($0, i, 1);
+			n = ord[c];
+			if (n < 32 || n >= 128) c = ".";
+			$0 = substr($0, 1, i - 1) c substr($0, i + 1);
+			i += length(c);
+		}
+		print $0;
+	}
+	'
+}
+
+get_wifi_country ()
+{
+	egrep "^[[:space:]]*country[[:space:]]*=" /etc/wpa_supplicant/wpa_supplicant.conf | cut -d "=" -f 2
+}
+
+set_wifi_country ()
+{
+	local wlan="$1"
+	local country="$2"
+
+	if wpa_cli -i "${wlan}" set country "${country}" | grep -q "OK"; then
+		iw reg set "${country}"
+		rfkill unblock wifi
+		return 0
+	fi
+	return 1
+}
+
+scan_wifi_networks ()
+{
+	local wlan="$1"
+	wpa_cli -i "${wlan}" scan >/dev/null 2>&1
+}
+
+get_scanned_wifi_networks ()
+{
+	local wlan="$1"
+	wpa_cli -i "${wlan}" scan_results | unescape_hexchars | awk -F"\t" 'NR > 1 && $5 != "" {printf("%s/", $5)}' 2>/dev/null
+}
+
+get_wifi_network_capabilities ()
+{
+	local wlan="$1"
+	local ssid="$2"
+	wpa_cli -i "${wlan}" scan_results | unescape_hexchars | awk -F"\t" -v ssid="${ssid}" '$5 == ssid {print $4; quit}' | sort -u
+}
+
+show_connecting_ssid_menu ()
+{
+	local wlan="$1"
+	local ssid="$2"
+	local title="$3"
+	local ok_caption="$4"
+	local cancel_caption="$5"
+	local ssid_list="$(wpa_cli -i "${wlan}" scan_results 2>/dev/null | unescape_hexchars | awk -F"\t" 'NR > 1 && $5 != "" {printf("%s/%s/", $5, $5)}')"
+
+	if [ -z "${ssid_list}" ]; then
+		msgbox "No SSIDs found" 
+		return
+	fi
+	local old_IFS="${IFS}"
+	IFS="/"
+	select_menu_item "${title}" "" "${ok_caption}" "${cancel_caption}" "${ssid}" --notags ${ssid_list}
+	IFS="${old_IFS}"
+}
+
+show_registered_ssid_menu ()
+{
+	local wlan="$1"
+	local ssid="$2"
+	local title="$3"
+	local ok_caption="$4"
+	local cancel_caption="$5"
+	local ssid_list="$(wpa_cli -i "${wlan}" list_network 2>/dev/null | unescape_hexchars | awk -F"\t" 'NR > 1 {printf("%s/%s/", $2, $2)}')"
+
+	if [ -z "${ssid_list}" ]; then
+		msgbox "No SSIDs registered"
+		return
+	fi
+	local old_IFS="${IFS}"
+	IFS="/"
+	select_menu_item "${title}" "" "${ok_caption}" "${cancel_caption}" "${ssid}" --notags ${ssid_list}
+	IFS="${old_IFS}"
+}
+
+new_wifi_network_obj ()
+{
+	local wlan="$1"
+	id="$(wpa_cli -i "${wlan}" add_network)"
+	echo -n "${id}"
+}
+
+set_wifi_network ()
+{
+	local wlan="$1"
+	local id="$2"
+	local key="$3"
+	local value="$4"
+
+	wpa_cli -i "${wlan}" set_network "${id}" "${key}" "${value}" 2>&1 | grep -q "OK"
+}
+
+delete_wifi_network_obj ()
+{
+	local wlan="$1"
+	local id="$2"
+	wpa_cli -i "${wlan}" remove_network "${id}" 2>&1 | grep -i "OK"
+}
+
+select_wifi_network ()
+{
+	local wlan="$1"
+	local ssid="$2"
+	local id="$(wpa_cli -i "${wlan}" list_network | unescape_hexchars | awk -F"\t" -v ssid="${ssid}" '$2 == ssid {print $1; quit}')"
+
+	if [ -z "${id}" ]; then
+		return 1;
+	fi
+	wpa_cli -i "${wlan}" select_network "${id}" 2>&1 | grep -q "OK"
+}
+
+relaunch_wifi_network ()
+{
+	local wlan="$1"
+
+	if ! ifdown "${wlan}"; then
+		wpa_cli -i "${wlan}" terminate
+		ifdown "${wlan}" >/dev/null 2>&1
+	fi
+
+	ifup "${wlan}" >/dev/null 2>&1
+}
+
+remove_wifi_network ()
+{
+	local wlan="$1"
+	local ssid="$2"
+
+	while true; do
+		id="$(wpa_cli -i "${wlan}" list_network | unescape_hexchars | awk -F"\t" -v ssid="${ssid}" '$2 == ssid {print $1; quit}')"
+		if [ -z "${id}" ]; then
+			break
+		fi
+		if ! wpa_cli -i "${wlan}" remove_network "${id}" | grep -q "OK"; then
+			break
+		fi
+	done
+
+	while true; do
+		id="$(wpa_cli list_network | unescape_hexchars | awk -F"\t" -v ssid="${ssid}" '$2 == ssid {print $1; quit}')"
+		if [ -z "${id}" ]; then
+			break
+		fi
+		if ! wpa_cli remove_network "${id}" | grep -q "OK"; then
+			break
+		fi
+	done
+}
+
+get_wifi_network_status ()
+{
+	local wlan="$1"
+	local ssid="$2"
+	local status="$(wpa_cli -i "${wlan}" list_network | unescape_hexchars | awk -F"\t" -v ssid="${ssid}" '$2 == ssid {print $4; quit}')"
+
+	echo -n "${status}"
+}
+
+enable_wifi_network ()
+{
+	local wlan="$1"
+	local id="$2"
+
+	wpa_cli -i "${wlan}" enable_network "${id}" > /dev/null 2>&1
+}
+
+ensure_wifi_network_enabled ()
+{
+	local wlan="$1"
+	local ssid="$2"
+	local status="$(wpa_cli -i "${wlan}" list_network | unescape_hexchars | awk -F"\t" -v ssid="${ssid}" '$2 == ssid {printf("%s:%s", $4, $1); quit}')"
+
+	if echo "${status}" | grep -i -q "DISABLED"; then
+		local id="${status#*:}"
+		enable_wifi_network "${wlan}" "${id}"
+		commit_wifi_network_settings "${wlan}"
+	fi
+}
+
+commit_wifi_network_settings ()
+{
+	local wlan="$1"
+	wpa_cli -i "${wlan}" save_config > /dev/null 2>&1
+	sync_disk
+
+	for wlan in $(list_wifi_iface); do
+		wpa_cli -i "${wlan}" reconfigure > /dev/null 2>&1
+	done
+	wpa_cli reconfigure > /dev/null 2>&1
+}
+
+reload_wifi_network_settings ()
+{
+	local wlan="$1"
+
+	for wlan in $(list_wifi_iface); do
+		wpa_cli -i "${wlan}" reconfigure > /dev/null 2>&1
+	done
+	wpa_cli reconfigure > /dev/null 2>&1
+}
+
+get_ntlm_hash ()
+{
+	local password="$1"
+	local ntlm_hash="$(echo -n "${password}" | iconv -t UTF-16LE | openssl md4 | awk '{print $2}')"
+	echo -n "${ntlm_hash}"
+}
+
+get_wpa_passphrase ()
+{
+	local ssid="$1"
+	local psk="$2"
+	local encoded_psk="$(wpa_passphrase "${ssid}" "${psk}" | awk '$0 ~ /^[ \t]*psk[ \t]*=[ \t]*/ {sub(/^[^=]+=[ \t]*/, ""); print}')"
+	echo -n "${encoded_psk}"
+}
+
+get_wifi_connectivity ()
+{
+	local wlan_list="$(list_wifi_iface)"
+	local wlan="$(echo "${wlan_list}" | awk '{print $1;quit}')"
+	local ipaddr="$(ip addr show "${wlan}" | awk '$1 == "inet" {sub(/\/.*$/,"",$2);print $2}')"
+	local gateway="$(route -n | awk '$1 == "0.0.0.0" {print $2}')"
+
+	if [ ! -z "${ipaddr}" -a ! -z "${gateway}" ]; then
+		status="$(get_wifi_status "${wlan}" | \
+			awk -v ipaddr="${ipaddr}" -F= '
+			{
+				if ($1 == "wpa_state" && $2 == "COMPLETED") {
+					wpa_completed=1;
+				} else if ($1 == "ip_address" && $2 == ipaddr) {
+					ipaddr_matched=1;
+				}
+				if (wpa_completed && ipaddr_matched) {
+					exit;
+				}
+			}
+			END {
+				if (wpa_completed && ipaddr_matched) {
+					print "ok"
+				}
+			}'
+		)"
+		if [ "${status}" = "ok" ]; then
+			ping -n -c 1 "${gateway}" >/dev/null 2>&1
+			return 0;
+		fi
+	fi
+	return 1;
+}
+
+do_try_internet_connectivity ()
+{
+	local DETECT_URL="http://captive.apple.com/hotspot-detect.html"
+	local USER_AGENT="CaptiveNetworkSupport-355.200.27 wispr"
+	local COOKIE_JAR="/tmp/trendcar-config-cookiejar.txt"
+
+	while true; do
+		rm -f "${COOKIE_JAR}";
+
+		local BASE_URL="$(echo -n "$(curl --cookie-jar ${COOKIE_JAR} -b ${COOKIE_JAR} -L -D - -H "User-Agent: ${USER_AGENT}" "${DETECT_URL}" 2>/dev/null | sed -n -e '/<base\s\+href/s/^.*<base\s\+href="\([^"]*\)".*$/\1/p' -e 's/\r\+$//')")"
+
+		local CONTINUE_URL="$(echo -n "$(curl --cookie-jar ${COOKIE_JAR} -b ${COOKIE_JAR} -L -H "User-Agent: ${USER_AGENT}" -H "X-Requested-With: XMLHttpRequest" -I "${DETECT_URL}" 2>/dev/null | awk '$1 == "Continue-Url:" {sub(/\r+$/,"",$2);print $2}')")"
+
+		if [ -z "${BASE_URL}" ] || [ -z "${CONTINUE_URL}" ]; then
+			echo "WiFi network access granted."
+			break;
+		fi
+
+		local email="$(inputbox "Email (enter empty string to cancel)")"
+
+		if [ "${email}" = "" ]; then
+			break;
+		fi
+
+		local password="$(passwordbox "Password (enter empty string to cancel)")"
+		if [ "${password}" = "" ]; then
+			break;
+		fi
+
+		echo "Trying to authenticate WiFi network access via ${BASE_URL}..."
+		local utf8="%E2%9C%93"
+		curl --cookie-jar ${COOKIE_JAR} -b ${COOKIE_JAR} -L --data-binary "utf8=${utf8}&email=${email}&password=${password}" "${BASE_URL}login?continue_url=${CONTINUE_URL}" 
+
+		for i in $(seq 1 5); do
+			sleep 1;
+			echo "Checking WiFi network access...#$i"
+			BASE_URL="$(echo -n "$(curl --cookie-jar ${COOKIE_JAR} -b ${COOKIE_JAR} -L -D - -H "User-Agent: ${USER_AGENT}" "${DETECT_URL}" 2>/dev/null | sed -n -e '/<base\s\+href/s/^.*<base\s\+href="\([^"]*\)".*$/\1/p' -e 's/\r\+$//')")"
+
+			CONTINUE_URL="$(echo -n "$(curl --cookie-jar ${COOKIE_JAR} -b ${COOKIE_JAR} -L -H "User-Agent: ${USER_AGENT}" -H "X-Requested-With: XMLHttpRequest" -I "${DETECT_URL}" 2>/dev/null | awk '$1 == "Continue-Url:" {sub(/\r+$/,"",$2);print $2}')")"
+
+			if [ -z "${BASE_URL}" ] || [ -z "${CONTINUE_URL}" ]; then
+				break;
+			fi
+		done
+
+		if [ -z "${BASE_URL}" ] || [ -z "${CONTINUE_URL}" ]; then
+			echo "WiFi network access granted."
+			break;
+		fi
+	done
+
+	rm -f "${COOKIE_JAR}";
+}
+
+do_wait_network_ready ()
+{
+	local check_internet="$1";
+	local maxtries=30;
+
+	for i in $(seq 1 ${maxtries}); do
+		echo "Checking IP address...$(( ${maxtries} - $i ))"
+
+		if get_wifi_connectivity; then
+			if [ -z "${check_internet}" ] || [ ${check_internet} -le 0 ]; then
+				return 0;
+			fi
+			do_try_internet_connectivity
+			return 0;
+		fi
+		sleep 1;
+	done
+
+	msgbox "WiFi network seemed unavailable"
+	return 0
+}
+
+do_current_status ()
+{
+	local wlan_list="$(list_wifi_iface)"
+	local wlan="$(echo "${wlan_list}" | awk '{print $1;quit}')"
+	local status="$(
+		get_wifi_status "${wlan}" | awk -F= '
+		{
+			n += 1;
+			keys[n] = $1;
+			len = length($1) > len? length($1): len;
+			values[$1]=$2
+		}
+		END {
+			for (i = 1; i <= n; i++) {
+				printf("%*s: %s\n", len, keys[i], values[keys[i]]);
+			}
+		}'
+	)"
+
+	msgbox "${status}"
+}
+
+do_join_new_network ()
+{
+	local wlan_list="$(list_wifi_iface)"
+	local wlan="$(echo "${wlan_list}" | awk '{print $1;quit}')"
+
+	if [ -z "${wlan}" ]; then
+		msgbox "No wireless interfaces found"
+		return
+	fi
+
+	if [ -z "$(get_wifi_country)" ]; then
+		do_set_wifi_regulatory_domain
+	fi
+
+	scan_wifi_networks "${wlan}"
+	local ssid="$(inputbox "Enter a valid SSID or empty to list all available SSIDs")"
+	ssid="$(normalize_ssid "${ssid}")"
+
+	if [ -z "${ssid}" ]; then
+		ssid="$(show_connecting_ssid_menu "${wlan}" "$(get_wifi_ssid "${wlan}")" "Select the SSID to connect" "Connect" "Cancel")"
+		ssid="$(normalize_ssid "${ssid}")"
+
+		if [  -z "${ssid}" ]; then
+			return
+		fi
+	fi
+
+	remove_wifi_network "${wlan}" "${ssid}"
+
+	local flags="$(get_wifi_network_capabilities "${wlan}" "${ssid}")"
+	local id="$(new_wifi_network_obj "${wlan}")"
+
+	if ! set_wifi_network "${wlan}" "${id}" "ssid" "\"${ssid}\"" || \
+	   ! set_wifi_network "${wlan}" "${id}" "scan_ssid" "1";     then
+		delete_wifi_network_obj "${wlan}" "${id}"
+		reload_wifi_network_settings "${wlan}"
+		msgbox "Unable to connect to ${ssid} (Config Error: #1)"
+		return
+	fi
+
+	if [ -z "${flags}" ]; then 
+		local security="$(select_menu_item "Specify the WiFi security manually" "" "Continue" "Cancel" "" \
+			"1" "None"                \
+			"2" "WPA/WPA2 Personal"   \
+			"3" "WPA2 Personal"       \
+			"4" "WPA/WPA2 Enterprise" \
+			"5" "WPA2 Enterprise"     \
+		)"
+
+		if [ -z "${security}" ]; then
+			delete_wifi_network_obj "${wlan}" "${id}"
+			reload_wifi_network_settings "${wlan}"
+			return
+		fi
+
+		case "${security}" in
+			1) flags=""             ;;
+			2) flags="[WPA-PSK-*]"  ;;
+			3) flags="[WPA2-PSK-*]" ;;
+			4) flags="[WPA-EAP-*]"  ;;
+			5) flags="[WPA2-EAP-*]" ;;
+			*) flags=""             ;;
+		esac
+	fi
+
+	case "${flags}" in
+		*WPA2-*)
+			if ! set_wifi_network "${wlan}" "${id}" "proto"    "RSN"   || \
+			   ! set_wifi_network "${wlan}" "${id}" "pairwise" "CCMP"; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				msgbox "Unable to connect to ${ssid} (Config Error: #2)"
+				return
+			fi
+			;;
+		*WPA-*)
+			if ! set_wifi_network "${wlan}" "${id}" "proto"    "WPA"   || \
+			   ! set_wifi_network "${wlan}" "${id}" "pairwise" "CCMP TKIP"; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				msgbox "Unable to connect to ${ssid} (Config Error: #3)"
+				return
+			fi
+			;;
+	esac
+
+	case "${flags}" in
+		*WPA*-EAP-*)
+			local login="$(inputbox "Account")"
+
+			if [ -z "${login}" ]; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				return
+			fi
+
+			local password="$(passwordbox "Password")"
+
+			if ! set_wifi_network "${wlan}" "${id}" "identity" "\"${login}\"" || \
+			   ! set_wifi_network "${wlan}" "${id}" "password" "hash:$(get_ntlm_hash "${password}")"; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				msgbox "Unable to connect to ${ssid} (Config Error: #4)"
+				return
+			fi
+
+			if ! set_wifi_network "${wlan}" "${id}" "key_mgmt" "WPA-EAP"   || \
+			   ! set_wifi_network "${wlan}" "${id}" "group"    "CCMP TKIP" || \
+			   ! set_wifi_network "${wlan}" "${id}" "eap"      "PEAP"      || \
+			   ! set_wifi_network "${wlan}" "${id}" "phase1"   "\"peapver=0\"" || \
+			   ! set_wifi_network "${wlan}" "${id}" "phase2"   "\"MSCHAPV2\""; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				msgbox "Unable to connect to ${ssid} (Config Error: #5)"
+				return
+			fi
+			;;
+		*WPA*-PSK-*)
+			local psk=$(passwordbox "Enter preshared key")
+
+			if ! set_wifi_network "${wlan}" "${id}" "psk" "$(get_wpa_passphrase "${ssid}" "${psk}")"; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				msgbox "Unable to connect to ${ssid} (Config Error: #6)"
+				return
+			fi
+
+			if ! set_wifi_network "${wlan}" "${id}" "key_mgmt" "WPA-PSK"   || \
+			   ! set_wifi_network "${wlan}" "${id}" "group"    "CCMP TKIP"; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				msgbox "Unable to connect to ${ssid} (Config Error: #7)"
+				return
+			fi
+			;;
+		*)
+			if ! set_wifi_network "${wlan}" "${id}" "key_mgmt" "NONE"; then
+				delete_wifi_network_obj "${wlan}" "${id}"
+				reload_wifi_network_settings "${wlan}"
+				msgbox "Unable to connect to ${ssid} (Config Error: #9)"
+				return
+			fi
+		       	;;
+	esac
+
+	enable_wifi_network "${wlan}" "${id}"
+	commit_wifi_network_settings "${wlan}"
+	select_wifi_network "${wlan}" "${ssid}"
+
+	case "${flags}" in
+		*WPA*-*)
+			do_wait_network_ready
+			;;
+		*)
+			do_wait_network_ready 1
+			;;
+	esac
+}
+
+do_switch_network ()
+{
+	local wlan_list="$(list_wifi_iface)"
+	local wlan="$(echo "${wlan_list}" | awk '{print $1;quit}')"
+
+	if [ -z "${wlan}" ]; then
+		msgbox "No wireless interfaces found"
+		return
+	fi
+
+	if [ -z "$(get_wifi_country)" ]; then
+		do_set_wifi_regulatory_domain
+	fi
+
+	local ssid="$(show_registered_ssid_menu "${wlan}" "$(get_wifi_ssid "${wlan}")" "Switch to a registered SSID" "Select" "Cancel")"
+
+	if [ -z "${ssid}" ]; then
+		return
+	fi
+
+	ensure_wifi_network_enabled "${wlan}" "${ssid}"
+	select_wifi_network "${wlan}" "${ssid}"
+
+	local flags="$(get_wifi_network_capabilities "${wlan}" "${ssid}")"
+
+	if [ "${flags}" = "[ESS]" ]; then
+		do_wait_network_ready 1
+	else
+		do_wait_network_ready
+	fi
+}
+
+do_remove_network ()
+{
+	local wlan_list="$(list_wifi_iface)"
+	local wlan="$(echo "${wlan_list}" | awk '{print $1;quit}')"
+
+	if [ -z "${wlan}" ]; then
+		msgbox "No wireless interfaces found"
+		return
+	fi
+
+	while true; do
+		local ssid="$(show_registered_ssid_menu "${wlan}" "$(get_wifi_ssid "${wlan}")" "Remove the registered SSIDs" "Remove" "Finish")"
+
+		if [ -z "${ssid}" ]; then
+			break
+		fi
+		remove_wifi_network "${wlan}" "${ssid}"
+		commit_wifi_network_settings "${wlan}"
+	done
+}
+
+do_set_wifi_regulatory_domain ()
+{
+	local wlan_list="$(list_wifi_iface)"
+	local wlan="$(echo "${wlan_list}" | awk '{print $1;quit}')"
+	local last_country="$(get_wifi_country)"
+	local country_list="$(cat /usr/share/zoneinfo/iso3166.tab | awk '$0 !~ /^#/ {gsub(/\t/, "/"); printf("%s/",$0)}')"
+	local old_IFS="${IFS}"
+	IFS="/"
+	local country="$(select_menu_item "Trend Car Configuration Tool (trendcar-config)" \
+		"Select the WiFi regulatory domain" "Select" "Cancel" "${last_country}" ${country_list})"
+	IFS="${old_IFS}"
+
+	if [ ! -z "${country}" ]; then
+		set_wifi_country "${wlan}" "${country}"
+		commit_wifi_network_settings "${wlan}"
+	fi
+}
+
+wifi_options_menu ()
+{
+	local wlan_list="$(list_wifi_iface)"
+	local wlan="$(echo "${wlan_list}" | awk '{print $1;quit}')"
+	local CHOICE=""
+
+	while true; do
+		scan_wifi_networks "${wlan}"
+		escaped_ssid="$(get_wifi_ssid "${wlan}" | escape_nonascii)";
+
+		CHOICE="$(select_menu_item                                                                 \
+			"Trend Car Configuration Tool (trendcar-config)"                                   \
+			"WiFi Options" "Select" "Back" "${CHOICE}"                                         \
+			"1 Current Status"   "Show current connection status (${escaped_ssid})"            \
+			"2 Join New Network" "Connect to the access point with new settings"               \
+			"3 Switch Network"   "Switch to a registered access point"                         \
+			"4 Delete Network"   "Delete the regsitered access points"                         \
+			"5 Set WiFi Domain"  "Set WiFi regulatory domain ($(get_wifi_country))"            \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) do_current_status ;;
+			2\ *) do_join_new_network ;;
+			3\ *) do_switch_network ;;
+			4\ *) do_remove_network ;;
+			5\ *) do_set_wifi_regulatory_domain ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at wifi_options_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at wifi_options_menu"
+	done
+}
+
+##################################################################################
+do_edit_hostname ()
+{
+	local cur_hostname="$(hostname)"
+	local new_hostname="$(inputbox "Edit current hostname" "${cur_hostname}")"
+
+	if [ ! -z "${new_hostname}" ] && [ ! "${cur_hostname}" = "${new_hostname}" ]; then
+		echo "${new_hostname}" > /etc/hostname
+		sed -i -e 's/^\(\s*127.0.1.1\s\+\).*$/\1'"${new_hostname}"'/' /etc/hosts
+		hostname -b localhost
+		hostname -b "${new_hostname}"
+		update_identity_txt "hostname" "${new_hostname}"
+		systemctl restart avahi-daemon
+		msgbox "Hostname changed to '${new_hostname}' successfully"
+	else
+		msgbox "Hostname not changed"
+	fi
+}
+
+do_assign_unique_hostname ()
+{
+	local new_hostname="trendcar-$(ip link show eth0 | awk '$1 ~ /ether/{print $2}' | md5sum | awk '{print substr($1, 1, 6)}')";
+	echo "${new_hostname}" > /etc/hostname
+	sed -i -e 's/^\(\s*127.0.1.1\s\+\).*$/\1'"${new_hostname}"'/' /etc/hosts
+	hostname -b localhost
+	hostname -b "${new_hostname}"
+	update_identity_txt "hostname" "${new_hostname}"
+	systemctl restart avahi-daemon
+	msgbox "Hostname changed to '${new_hostname}' successfully"
+}
+
+do_assign_default_hostname ()
+{
+	local new_hostname="raspberry"
+	echo "${new_hostname}" > /etc/hostname
+	sed -i -e 's/^\(\s*127.0.1.1\s\+\).*$/\1'"${new_hostname}"'/' /etc/hosts
+	hostname -b localhost
+	hostname -b "${new_hostname}"
+	update_identity_txt "hostname" "${new_hostname}"
+	systemctl restart avahi-daemon
+	msgbox "Hostname changed to '${new_hostname}' successfully"
+}
+
+change_hostname_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		CHOICE="$(select_menu_item                                                          \
+			"Trend Car Configuration Tool (trendcar-config)"                            \
+			"Change Hostname" "Select" "Back" "${CHOICE}"                               \
+			"1 Edit Hostname"    "Edit current hostname $(hostname)"                    \
+			"2 Unique Hostname"  "Assign the unique hostname according to MAC address"  \
+			"3 Default Hostname" "Assign the default hostname: raspberry"               \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) do_edit_hostname ;;
+			2\ *) do_assign_unique_hostname ;;
+			3\ *) do_assign_default_hostname ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at change_hostname_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at change_hostname_menu"
+	done
+}
+
+##################################################################################
+do_change_passwd()
+{
+	password=$(passwordbox "Change password of pi")
+
+	if [ ! -z "${password}" ] && echo "pi:${password}" | chpasswd; then
+		update_identity_txt "passwd" "<user entered>"
+		msgbox "Password changed successfully"
+	else
+		msgbox "Password not changed"
+	fi
+}
+
+do_assign_random_passwd ()
+{
+	password="$(dd if=/dev/random count=1 2>/dev/null| md5sum | awk '{printf("%s", substr($1, 1, 8))}')";
+
+	if echo "pi:${password}" | chpasswd; then
+		update_identity_txt "passwd" "${password}"
+		msgbox "Password changed successfully.\nUpdated random password '${password}' to /boot/identity.txt."
+	else
+		msgbox "Password not changed"
+	fi
+}
+
+do_assign_default_passwd ()
+{
+	if echo "pi:raspberry" | chpasswd; then
+		update_identity_txt "passwd" "raspberry"
+		msgbox "Password changed successfully.\nUpdated default password 'raspberry' to /boot/identity.txt."
+	else
+		msgbox "Password not changed"
+	fi
+}
+
+change_user_password_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		CHOICE="$(select_menu_item                                             \
+			"Trend Car Configuration Tool (trendcar-config)"               \
+			"Change Password" "Select" "Back" "${CHOICE}"                  \
+			"1 New Password"     "Specify a new password"                  \
+			"2 Random Password"  "Assign a random password"                \
+			"3 Default Password" "Assign the default password: raspberry"  \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) do_change_passwd ;;
+			2\ *) do_assign_random_passwd ;;
+			3\ *) do_assign_default_passwd ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at change_user_password_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at change_user_password_menu"
+	done
+}
+
+##################################################################################
+do_reload_daemon ()
+{
+	systemctl reload trendcar
+	msgbox "TrendCar reloaded"
+}
+
+do_start_stop_daemon ()
+{
+	local action="$(
+		systemctl status trendcar | \
+		awk '$1 == "Active:" {
+			if ($2 == "active") {
+				print "stop";
+			} else {
+				print "start";
+			}
+		}'
+	)"
+	systemctl "${action}" trendcar
+	msgbox "TrendCar ${action}ed"
+}
+
+do_enable_disable_webconsole ()
+{
+	local value="$(
+		trendcar-ini get WEBCONSOLE enabled | \
+		grep -q -i "True" && echo -n "False" || echo -n "True"
+	)"
+	trendcar-ini set WEBCONSOLE enabled "${value}"
+	systemctl reload trendcar
+	msgbox "Webconsole $([ "${value}" = "False" ] && echo -n "disabled" || echo -n "enabled")"
+}
+
+do_change_webconsole_port ()
+{
+	local status="$(systemctl status trendcar | awk '$1 == "Active:" {print $2}')"
+	local enabled="$(trendcar-ini get WEBCONSOLE enabled)"
+	local cur_port="$(trendcar-ini get WEBCONSOLE listen_port)"
+	local new_port="$(inputbox "Change listening port of the web console" "${cur_port}")"
+
+	if [ -z "${new_port}" ]; then
+		return;
+	fi
+
+	if ! echo "${new_port}" | egrep -q '^[0-9]+$'; then
+		msgbox "Non-number characters found in '${new_port}'"
+		return;
+	fi
+	if [ "${new_port}" -lt 80 ]; then
+		msgbox "Port numbers less than 80 were not recommended: ${new_port}"
+		return;
+	fi
+	if [ "${new_port}" -gt 65535 ]; then
+		msgbox "Port numbers larger than 65535 were not allowed: ${new_port}"
+		return;
+	fi
+	if [ "${new_port}" = "${cur_port}" ]; then
+		msgbox "Port number remained unchanged."
+		return;
+	fi
+
+	trendcar-ini set WEBCONSOLE listen_port "${new_port}"
+
+	if [ ! "${status}" = "active" ]; then
+		msgbox "New port ${new_port} has been assigned for the web console but not verified because TrendCar daemon was inactive."
+	elif [ ! "${enabled}" = "True" ]; then
+		msgbox "New port ${new_port} has been assigned for the web console but not verified because web console was not enabled yet."
+	else
+		systemctl reload trendcar
+		sleep 3;
+
+		local tries=10;
+		while [ "${tries}" -gt 0 ]; do
+			local status="$(systemctl status trendcar | awk '$1 == "Active:" {print $2}')"
+
+			if [ "${status}" = "active" ]; then
+				break;
+			fi
+			sleep 1;
+			tries=$(( ${tries} - 1 ))
+		done
+
+		local pid="$(
+			sudo netstat -tnlp 2>/dev/null | awk -v listen_port=${new_port} '
+			$4 ~ ":" listen_port "$" && $7 ~ /\/python$/ {
+				pid = $7; sub(/\/.*$/, "", pid);
+				print pid
+			}
+		')"
+
+		if [ -z "${pid}" ]; then
+			trendcar-ini set WEBCONSOLE listen_port "${cur_port}"
+			systemctl reload trendcar
+			msgbox "The specified port ${new_port} seemed not working properly for the web console. Please specifiy another one."
+			return;
+		fi
+
+		case "$(cat /proc/${pid}/cmdline)" in
+			*trendcar*)
+				msgbox "New port ${new_port} has been assigned for the web console and verified." ;;
+			*)
+				trendcar-ini set WEBCONSOLE listen_port "${cur_port}"
+				systemctl reload trendcar
+				msgbox "Failed to assign the new port ${new_port} for the web console since it was occupied by the other processes." ;;
+		esac
+	fi
+}
+
+do_python_preference ()
+{
+	local cur_python_preference="$(trendcar-ini get DEFAULT python_preference)"
+	local opencv_version="$(cat /usr/local/lib/opencv/VERSION 2>/dev/null)"
+	if [ -z "${opencv_version}" ]; then
+		local python_preference_list="2.7/Python 2.7/3.5/Python 3.5/"
+	else
+		local python3_opencv_version="$(python3 -c "import cv2; print(cv2.__version__)")"
+		local python_preference_list="2.7/Python 2.7/2.7-cv3/Python 2.7 + OpenCV ${opencv_version}/3.5/Python 3.5/"
+		if [ ! "${opencv_version}" = "${python3_opencv_version-3.4.3}" ]; then
+			python_preference_list="${python_preference_list}3.5-cv3/Python 3.5 + OpenCV ${opencv_version}/"
+		fi
+	fi
+	local old_IFS="${IFS}"
+	IFS="/"
+	local version="$(select_menu_item "Trend Car Configuration Tool (trendcar-config)" \
+		"Select the Python Preference" "Select" "Cancel" "${cur_python_preference}" --notags ${python_preference_list})"
+	IFS="${old_IFS}"
+
+	if [ ! -z "${version}" ]; then
+		trendcar-ini setuser DEFAULT python_preference "${version}"
+		systemctl restart trendcar
+		msgbox "Selected Python ${version} and restarted Trend Car daemon"
+	fi
+}
+
+check_rpi_version ()
+{
+	echo -n "Checking Raspberry Pi 3 Model B Plus........"
+
+	if get_pi_model_name | grep -q "Raspberry Pi 3 Model B Plus"; then
+		echo "[PASS]"
+	else
+		echo "[FAIL]"
+	fi
+}
+
+check_sd_size ()
+{
+	echo -n "Checking SD Capacity (>= 16GiB)............."
+
+	udevadm info -a -n /dev/mmcblk0 | egrep "ATTRS?{(type|size)}" | awk -F= '
+	$1 ~ /type/ { type=$3; gsub(/"/, "", type); }
+	$1 ~ /size/ { size=$3; gsub(/"/, "", size); }
+	END {
+		if (type == "SD" && int(size) >= 31116288) {
+			print "[PASS]"
+		} else {
+			print "[FAIL]"
+		}
+	}'
+}
+
+check_movidius ()
+{
+	echo -n "Checking Movidius Neural Compute Stick......"
+
+	#if ! (lsusb | egrep -q -i " (03E7:2150|03E7:F63B)" && dmesg | grep -q -i movidius); then
+	#	echo "[FAIL]"
+	#fi
+
+	python <<-EOF
+	import sys
+	import mvnc.mvncapi as fx
+
+	devices = fx.enumerate_devices()
+	if len(devices) < 1:
+	    sys.exit(1)
+
+	dev = fx.Device(devices[0])
+
+	try:
+	    dev.open()
+	except:
+	    sys.exit(1)
+
+	try:
+	    dev.close()
+	except:
+	    sys.exit(1)
+
+	sys.exit(0)
+	EOF
+
+	if [ $? -eq 0 ]; then
+		echo "[PASS]"
+	else
+		echo "[FAIL]"
+	fi
+}
+
+check_logitech_c310 ()
+{
+	echo -n "Checking Logitech Webcam C310..............."
+
+	if lsusb | grep -q -i " 046D:081B Logitech.*Webcam.*C310"; then
+		echo "[PASS]";
+	else
+		echo "[FAIL]";
+	fi
+}
+
+do_hardware_check_list ()
+{
+	local daemon_status="$(systemctl status trendcar | awk '$1 == "Active:" { print $2 }')"
+
+	echo "Checking hardware, please wait..."
+
+	if [ "${daemon_status}" = "active" ]; then
+		systemctl stop trendcar
+		sleep 2;
+
+		while true; do
+			status="$(systemctl status trendcar | awk '$1 == "Active:" { print $2 }')"
+			if [ "${status}" = "inactive" ]; then
+				break
+			fi
+		done
+	fi
+
+	msgbox "$(
+		check_rpi_version;
+		check_sd_size;
+		trendcar-cli --self-check;
+		check_logitech_c310;
+		check_movidius;
+	)"
+
+	if [ "${daemon_status}" = "active" ]; then
+		systemctl start trendcar
+
+		while true; do
+			status="$(systemctl status trendcar | awk '$1 == "Active:" { print $2 }')"
+			if [ "${status}" = "active" ]; then
+				break
+			fi
+		done
+	fi
+}
+
+do_drive_wheel_direction ()
+{
+	local method="$1"
+	local wheel="$2"
+	local duration="$3"
+
+	if ! trendcar-cli --test-wheel "${method},${wheel},${duration}"; then
+		msgbox "Error occurred while driving wheels"
+	fi
+}
+
+do_system_shutdown ()
+{
+	clear;
+	echo "Shutting down..."
+	sync_disk
+	poweroff
+}
+
+do_autopilot_activation_duration ()
+{
+	local cur_max_activation_seconds="$(trendcar-ini get AUTOPILOT max_activation_seconds)"
+	local new_max_activation_seconds="$(inputbox "Change the maximum activation duration in seconds to run autopilot (0 = infinite)" "${cur_max_activation_seconds}")"
+
+	if [ -z "${new_max_activation_seconds}" ]; then
+		return;
+	fi
+
+	if ! echo "${new_max_activation_seconds}" | egrep -q '^[0-9.]+$'; then
+		msgbox "Invalid characters found in '${new_max_activation_seconds}'"
+		return;
+	fi
+
+	if [ "${new_max_activation_seconds}" = "${cur_max_activation_seconds}" ]; then
+		msgbox "Maximum activation duration remained unchanged."
+		return;
+	fi
+
+	trendcar-ini set AUTOPILOT max_activation_seconds "${new_max_activation_seconds}"
+
+	msgbox "Maximum activation duration updated."
+	systemctl reload trendcar
+	sleep 3;
+}
+
+do_autopilot_starting_straight_duration ()
+{
+	local cur_min_starting_straight_seconds="$(trendcar-ini get AUTOPILOT min_starting_straight_seconds)"
+	local new_min_starting_straight_seconds="$(inputbox "Change the minimum duration in seconds to go straight (0 = disabled)" "${cur_min_starting_straight_seconds}")"
+
+	if [ -z "${new_min_starting_straight_seconds}" ]; then
+		return;
+	fi
+
+	if ! echo "${new_min_starting_straight_seconds}" | egrep -q '^[0-9.]+$'; then
+		msgbox "Invalid characters found in '${new_min_starting_straight_seconds}'"
+		return;
+	fi
+
+	if [ "${new_min_starting_straight_seconds}" = "${cur_min_starting_straight_seconds}" ]; then
+		msgbox "Maximum activation duration remained unchanged."
+		return;
+	fi
+
+	trendcar-ini set AUTOPILOT min_starting_straight_seconds "${new_min_starting_straight_seconds}"
+
+	msgbox "Minimum starting straight duration updated."
+	systemctl reload trendcar
+	sleep 3;
+}
+
+autopilot_settings_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		CHOICE="$(select_menu_item                                                                  \
+			"Trend Car Configuration Tool (trendcar-config)"                                    \
+			"Autopilot Settings" "Select" "Back" "${CHOICE}"                                    \
+			"1 Activation Duration"        "Specify maximum duration to run autopilot"          \
+			"2 Starting Straight Duration" "Specify minimum duration to enforce going straight" \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) do_autopilot_activation_duration ;;
+			2\ *) do_autopilot_starting_straight_duration ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at autopilot_settings_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at autopilot_settings_menu"
+	done
+}
+
+hardware_manual_test_menu ()
+{
+	local METHOD=""
+	local WHEEL=""
+	local cmd="";
+	local duration="";
+
+	while true; do
+		METHOD="$(select_menu_item                                                            \
+			"Trend Car Configuration Tool (trendcar-config)"                              \
+			"Hardware Manual Test - Choose the test method" "Select" "Back" "${METHOD}"   \
+			"1 Drive Forwards"    "Run the wheel forwards"                                \
+			"2 Drive Backwards"   "Run the wheel backwards"                               \
+			"3 Switch Directions" "Run the wheel forwards and backwards"                  \
+		)"
+
+		case "${METHOD}" in
+			1\ *) cmd="forward" ; duration="5"  ;;
+			2\ *) cmd="backward"; duration="5"  ;;
+			3\ *) cmd="switch"  ; duration="15" ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${METHOD}' at hardware_manual_test_menu" ;;
+		esac       || msgbox "There was an error running option '${METHOD}' at hardware_manual_test_menu"
+
+		while true; do
+			WHEEL="$(select_menu_item                                                             \
+				"Trend Car Configuration Tool (trendcar-config)"                              \
+				"Hardware Manual Test - Choose the wheels" "Select" "Back" "${WHEEL}"         \
+				"1 Left-front Wheel"  "Choose the indivisual left-front wheel"                \
+				"2 Left-rear Wheel"   "Choose the indivisual left-rear wheel"                 \
+				"3 Right-front Wheel" "Choose the indivisual right-front wheel"               \
+				"4 Right-rear Wheel"  "Choose the indivisual right-rear wheel"                \
+				"5 All Wheels"        "Choose all the 4 wheels"                               \
+			)"
+
+			case "${WHEEL}" in
+				1\ *) do_drive_wheel_direction "${cmd}" "left-front"  "${duration}" ;;
+				2\ *) do_drive_wheel_direction "${cmd}" "left-rear"   "${duration}" ;;
+				3\ *) do_drive_wheel_direction "${cmd}" "right-front" "${duration}" ;;
+				4\ *) do_drive_wheel_direction "${cmd}" "right-rear"  "${duration}" ;;
+				5\ *) do_drive_wheel_direction "${cmd}" "all"         "${duration}" ;;
+				"") break ;;
+				*) msgbox "Programmer error: unrecognized option '${WHEEL}' at hardware_manual_test_menu" ;;
+			esac    || msgbox "There was an error running option '${WHEEL}' at hardware_manual_test_menu"
+		done
+	done
+
+	if [ ! -z "${cmd}" ]; then
+		systemctl restart trendcar
+	fi
+}
+
+control_daemon_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		local DAEMON_ACTION="$(
+			systemctl status trendcar | \
+			awk '$1 == "Active:" {
+				if ($2 == "active") {
+					print "Stop";
+				} else {
+					print "Start";
+				}
+			}'
+		)"
+		local WEBCONSOLE_ACTION="$(
+			trendcar-ini get WEBCONSOLE Enabled | \
+			grep -q -i "True" && echo -n "Disable" || echo -n "Enable"
+		)"
+		CHOICE="$(select_menu_item                                                                         \
+			"Trend Car Configuration Tool (trendcar-config)"                                           \
+			"Control Daemon" "Select" "Back" "${CHOICE}"                                               \
+			"1 Reload Daemon"                     "Reload the Trend Car daemon"                        \
+			"2 ${DAEMON_ACTION} Daemon"           "${DAEMON_ACTION} the Trend Car daemon"              \
+			"3 ${WEBCONSOLE_ACTION} Web Console"  "${WEBCONSOLE_ACTION} the web console"               \
+			"4 Change Web Console Port"           "Configure listening port of the web console"        \
+			"5 Specify Python Preference"         "Run Trend Car programs with Python 2.7 or Python 3" \
+			"6 Autopilot Settings"                "Configure autopilot settings"                       \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) do_reload_daemon ;;
+			2\ *) do_start_stop_daemon ;;
+			3\ *) do_enable_disable_webconsole ;;
+			4\ *) do_change_webconsole_port ;;
+			5\ *) do_python_preference ;;
+			6\ *) autopilot_settings_menu ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at control_daemon_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at control_daemon_menu"
+	done
+}
+
+quality_check_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		CHOICE="$(select_menu_item                                                  \
+			"Trend Car Configuration Tool (trendcar-config)"                    \
+			"Quality Check" "Select" "Back" "${CHOICE}"                         \
+			"1 Hardware Check List"  "Run hardware check list"                  \
+			"2 Hardware Manual Test" "Run hardware manual test"                 \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) do_hardware_check_list  ;;
+			2\ *) hardware_manual_test_menu ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at trendcar_options_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at trendcar_options_menu"
+	done
+}
+
+trendcar_options_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		CHOICE="$(select_menu_item                                                  \
+			"Trend Car Configuration Tool (trendcar-config)"                    \
+			"Trend Car Options" "Select" "Back" "${CHOICE}"                     \
+			"1 Control Daemon"       "Control the Trend Car daemon"             \
+			"2 Quality Check"        "Run quality check procedures"             \
+			"3 System Shutdown"      "Gracefully power off the system"          \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) control_daemon_menu ;;
+			2\ *) quality_check_menu  ;;
+			3\ *) do_system_shutdown  ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at trendcar_options_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at trendcar_options_menu"
+	done
+}
+
+##################################################################################
+do_show_version_info ()
+{
+	version="$(trendcar-ini get DEFAULT version)"
+	release_date="$(trendcar-ini get DEFAULT release_date)"
+	version_info="Trend Car v${version}, released on ${release_date}"
+	msgbox "${version_info}"
+}
+
+get_usb_disk_list ()
+{
+	mount | grep '/media/usb' | awk '$3 ~ /^\/media\/usb[0-9]/ {print $3}'
+}
+
+update_with_file ()
+{
+	local trendcar_zip="$1"
+	local tmpbasedir="/tmp/trendcar_updates"
+
+	echo -n "Extracting ${trendcar_zip}..."
+
+	rm -rf "${tmpbasedir}"
+	mkdir -p "${tmpbasedir}"
+
+	if ! 7za x -p'TrendCar!' -o"${tmpbasedir}" "${trendcar_zip}" 2>&1; then
+		echo "Failed to extract the file"
+		return 1;
+	fi
+	if [ ! -r "${tmpbasedir}/setup.sh" ]; then
+		echo "Failed to execute setup"
+		return 1;
+	fi
+	cd "${tmpbasedir}"; ./setup.sh 2>&1
+	sync_disk
+	echo "Done."
+	return 0;
+}
+
+do_update_with_usb_disk ()
+{
+	local usb_disk_list="$(get_usb_disk_list)";
+
+	if [ -z "${usb_disk_list}" ]; then
+		msgbox "Unable to update programs. No USB disks were found."
+		return 1;
+	fi
+
+	local logs="$(
+		for disk in ${usb_disk_list}; do
+			local trendcar_zip="$(find "${disk}" -maxdepth 1 -name "trendcar*.7z" | sort -ru | head -n 1)"
+
+			if [ -r "${trendcar_zip}" ]; then
+				update_with_file "${trendcar_zip}"
+				umount "${disk}"
+			fi
+		done
+	)"
+
+	if [ -z "${logs}" ]; then
+		msgbox "No update packages were found on the USB disk."
+		return 1;
+	fi
+
+	logs="$(printf "Press [ESC] or [TAB, Enter] to exit.\n")${logs}"
+	msgbox --scrolltext "${logs}"
+	return 0;
+}
+
+do_update_with_network ()
+{
+	sh /opt/trendcar/bin/trendcar-init-env.sh
+}
+
+software_update_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		CHOICE="$(select_menu_item                                       \
+			"Trend Car Configuration Tool (trendcar-config)"         \
+			"Software Update" "Select" "Back" "${CHOICE}"            \
+			"1 Show Version Info"   "Show TrendCar version info"     \
+			"2 Update with USB Disk" "Update programs with USB disk" \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) do_show_version_info   ;;
+			2\ *) do_update_with_usb_disk; exec trendcar-config ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at software_update_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at software_update_menu"
+	done
+}
+
+##################################################################################
+main_menu ()
+{
+	local CHOICE=""
+
+	while true; do
+		CHOICE="$(select_menu_item                                              \
+			"Trend Car Configuration Tool (trendcar-config)"                \
+			"Main Menu" "Select" "Finish" "${CHOICE}"                       \
+			"1 WiFi Options"     "Configure WiFi settings"                  \
+			"2 Change Password"  "Change password for the default user pi"  \
+			"3 Change Hostname"  "Change the hostname ($(hostname))"        \
+			"4 TrendCar Options" "Configure TrendCar settings"              \
+			"5 Software Update"  "Update the system and programs"           \
+		)"
+
+		case "${CHOICE}" in
+			1\ *) wifi_options_menu ;;
+			2\ *) change_user_password_menu ;;
+			3\ *) change_hostname_menu ;;
+			4\ *) trendcar_options_menu ;;
+			5\ *) software_update_menu ;;
+		          "") break ;;
+			   *) msgbox "Programmer error: unrecognized option '${CHOICE}' at main_menu" ;;
+		esac       || msgbox "There was an error running option '${CHOICE}' at main_menu"
+	done
+}
+
+##################################################################################
+
+main_ui ()
+{
+	init_term_sizes
+
+	if [ -z "$1" ]; then
+		main_menu;
+	else
+		while [ ! -z "$1" ]; do
+			local cmd="";
+			local args="";
+
+			while [ ! -z "$1" ]; do
+				case "$1" in
+					--*)
+						if [ ! -z "${cmd}" ]; then
+							break;
+						fi
+						cmd="${1#--}"; shift;
+						;;
+					*)
+						args="${args} $1"; shift;
+						;;
+				esac
+			done
+
+			if [ -z "${cmd}" ]; then
+				break;
+			fi
+			${cmd} ${args}
+		done
+	fi
+}
+
+if [ $(id -u) -ne 0 ]; then 
+	exec sudo sh $0 "$@";
+	exit 1;
+fi
+
+main_ui $*
+sync_disk
+

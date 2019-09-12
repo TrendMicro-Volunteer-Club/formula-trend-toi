@@ -1,0 +1,54 @@
+#!/bin/sh
+
+_realpath () {
+	hash realpath >/dev/null 2>&1 && realpath "$1" && return;
+	[ -L "$1" ] && readlink "$1" && return;
+	echo "$1"
+}
+SCRIPT_BASE=$(cd $(dirname $(_realpath $0)); pwd)
+
+. "${SCRIPT_BASE}"/functions.inc
+
+if running_in_pi && [ $(id -u) -ne 0 ]; then 
+	exec sudo sh $0 "$@";
+	exit 1;
+fi
+
+ARGS=""
+while [ ! -z "$1" ]; do
+	case "$1" in
+		-h|--help)
+			echo "$(basename "$0") [-h] [-i] [-f <script>] [<cmd>...]"
+			exit 1;
+			;;
+		-i)
+			ARGS="${ARGS} --interactive"; shift;
+			;;
+		-f)
+			if [ -z "$2" ]; then
+				echo "Error: Script not specified"
+				exit 1;
+			fi
+
+			if [ ! -r "$2" ]; then
+				echo "Error: Unable to read the script: $2"
+				exit 1;
+			fi
+		
+			ARGS="${ARGS} --script $2"; shift; shift;
+			;;
+		-q)
+			ARGS="${ARGS} --quiet --loglevel QUIET"; shift;
+			;;
+		 *)
+		 	break;
+			;;
+	esac
+done
+
+if [ ! -z "$*" ]; then
+	ARGS="${ARGS} --cmd \"$*\""
+fi
+
+${PYTHON} "${TRENDCAR_HOME}/trendcar/trendcar.py" --console ${ARGS}
+

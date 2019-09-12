@@ -1,0 +1,210 @@
+<html><head>
+<title>Web Console for TrendCar</title>
+<style>
+body {
+	margin: 0px;
+	padding: 0px;
+}
+#live {
+	width:500px;
+	height:375px;
+	border:0;
+}
+#joystick {
+	border: 1px solid #9C9898;
+	width:300px;
+	height:300px;
+	margin-bottom:30px;
+}
+@media only screen and (max-width: 200px) {
+	#live {
+		width:100px;
+		height:100px;
+	}
+	#joystick {
+		width:200%;
+		height:200%;
+	}
+}
+</style>
+<script src="joy.js"></script>
+<script language="javascript">
+<!--//
+function drive(steering, throttle)
+{
+	var repeated         = document.getElementById("repeated");
+	var steering_slider  = document.getElementById("steering");
+	var steering_label   = document.getElementById("steering_label");
+	var throttle_slider  = document.getElementById("throttle");
+	var throttle_label   = document.getElementById("throttle_label");
+
+	if (steering_slider.value == steering && throttle_slider.value == throttle) {
+		if (repeated.value >= 5) {
+			return;
+		}
+		repeated.value = repeated.value + 1
+	} else {
+		repeated.value = 0;
+	}
+	steering_slider.value = steering
+	throttle_slider.value = throttle
+
+	try {
+		var url = "/drive?steering=" + steering + "&throttle=" + (throttle / 100.0)
+		var request = new XMLHttpRequest()
+		request.open("GET", url);
+		request.onload = function(e) {
+			if (request.readyState == 4 && request.status == 200 && request.getResponseHeader("content-type") ==="application/json") {
+				result                   = JSON.parse(this.responseText);
+				steering_label.innerText = parseInt(result.steering)
+				throttle_label.innerText = parseInt(result.throttle * 100.0)
+			}
+		}
+		request.send(null);
+	} catch(e) {
+	}
+}
+
+function joystick_to_drive(joystick)
+{
+	var steering = 0.0
+	var throttle = 0.0
+
+	var gamepads = navigator.getGamepads ? navigator.getGamepads() : (navigator.webkitGetGamepads ? navigator.webkitGetGamepads : []);
+
+	if (gamepads && gamepads.length > 0) {
+		gamepad  = gamepads[0];
+		if (gamepad) {
+			var steering_wheel_checkbox = document.getElementById("steering_wheel");
+			steering_axis = steering_wheel_checkbox.checked? 0: 2;
+
+			throttle = -parseInt(gamepad.axes[1] * 10) * 10
+			steering = parseInt(gamepad.axes[steering_axis] * 10) * 9
+		}
+	}
+	if (steering == 0.0 && throttle == 0.0) {
+		steering = parseInt(90.0/100.0 * joystick.GetX() * 2)
+		throttle = joystick.GetY() * 2
+	}
+	drive(steering, throttle)
+}
+
+function take_snapshot(obj)
+{
+	try {
+		var url = "/photo"
+		var request = new XMLHttpRequest()
+		request.open("GET", url);
+		request.onload = function(e) {
+			if (request.readyState == 4 && request.status == 200 && request.getResponseHeader("content-type") ==="application/json") {
+				result = JSON.parse(this.responseText);
+				alert("Photo " + result.filename + " was saved locally.")
+			}
+		}
+		request.send(null);
+	} catch(e) {
+	}
+}
+
+function toggle_recording(changing)
+{
+	var recording_button = document.getElementById("recording")
+
+	if (recording_button.value == "Start Recording") {
+		var recording = false;
+	} else {
+		var recording = true;
+	}
+
+	try {
+		var url = "/recording"
+
+		if (changing) {
+			recording = !recording;
+			url += recording? "?start": "?stop";
+		}
+
+		var request = new XMLHttpRequest()
+		request.open("GET", url);
+		request.onload = function(e) {
+			if (request.readyState == 4 && request.status == 200 && request.getResponseHeader("content-type") ==="application/json") {
+				result = JSON.parse(this.responseText);
+				if (result.recording) {
+					recording_button.value = "Stop Recording";
+				} else {
+					recording_button.value = "Start Recording";
+				}
+			}
+		}
+		request.send(null);
+	} catch(e) {
+	}
+}
+
+function toggle_autodrive(changing)
+{
+	var autodrive_button = document.getElementById("autodrive")
+
+	if (autodrive_button.value == "Start AutoDrive") {
+		var autodrive = false;
+	} else {
+		var autodrive = true;
+	}
+
+	try {
+		var url = "/autodrive"
+
+		if (changing) {
+			autodrive = !autodrive;
+			url += autodrive? "?start": "?stop";
+		}
+
+		var request = new XMLHttpRequest()
+		request.open("GET", url);
+		request.onload = function(e) {
+			if (request.readyState == 4 && request.status == 200 && request.getResponseHeader("content-type") ==="application/json") {
+				result = JSON.parse(this.responseText);
+				if (result.autodrive == "starting" || result.autodrive == "started") {
+					autodrive_button.value = "Stop AutoDrive";
+				} else {
+					autodrive_button.value = "Start AutoDrive";
+				}
+			}
+		}
+		request.send(null);
+	} catch(e) {
+	}
+}
+//-->
+</script>
+</head>
+<body onload="toggle_recording(false); toggle_autodrive(false)">
+<center>
+<input id="repeated" type="hidden" value="0">
+<table border="0">
+<tr><td rowspan="4" nowrap><iframe id="live" src="/live"></iframe></td>
+<td nowrap><input id="steering_wheel" type="checkbox" checked/>Using steering wheel</td></tr>
+<tr><td nowrap><input type="button" value="Take Snapshot" onclick="take_snapshot(this)"></td></tr>
+<tr><td nowrap><input type="button" id="recording" value="Start Recording" onclick="toggle_recording(true)"></td></tr>
+<tr><td nowrap><input type="button" id="autodrive" value="Start AutoDrive" onclick="toggle_autodrive(true)"></td></tr>
+</table>
+<table border="0">
+<tr>
+	<td nowrap>Steering:</td>
+	<td nowrap><input id="steering" type="range" min="-90" max="90" value="0" style="width:150px"/>
+	<td nowrap><div id="steering_label">-</div></td>
+	<td nowrap>&nbsp;degree</td>
+	<td nowrap>Throttle:</td>
+	<td nowrap><input id="throttle" type="range" min="-100" max="100" value="0" style="width:150px"/>
+	<td nowrap><div id="throttle_label">-</div></td>
+	<td nowrap>%</td>
+</tr></table>
+<div id="joystick"></div>
+<script language="javascript">
+<!--//
+var joystick = new JoyStick('joystick');
+setInterval("joystick_to_drive(joystick)", 50);
+//-->
+</script>
+</body>
+</html>
