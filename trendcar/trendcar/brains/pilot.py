@@ -34,8 +34,8 @@ class TrendCarPilot(AutoPilot):
 
         have_green_light = self._light_check(dashboard,self.green_light_range)
 
-        #sys.stderr.write("###  light detection:" +have_green_light +","+ have_yellow_light +"\n")
-        #print(green_light)
+        info("###  light detection:" +str(have_green_light) +","+ str(have_yellow_light) +"\n")
+        #info(green_light)
 
         if have_yellow_light:
             steering = 0.0
@@ -126,7 +126,7 @@ class TrendCarPilot(AutoPilot):
         hava_light = False
         img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(img_hsv,color_range[0],color_range[1] )
-        _, contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area > 50:
