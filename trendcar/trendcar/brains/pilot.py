@@ -8,8 +8,8 @@ import sys
 @AutoPilot.register
 class TrendCarPilot(AutoPilot):
     _track_view_range = (0.5, 0.8)
-    yellow_light_range = [(20, 100, 100),(40, 255, 255)] 
-    green_light_range = [(40, 100, 100),(80, 255, 255)]  
+    yellow_light_range = [(20, 100, 100),(40, 255, 255)]
+    green_light_range = [(40, 100, 100),(80, 255, 255)]
 
 
     def __init__(self):
@@ -28,26 +28,26 @@ class TrendCarPilot(AutoPilot):
         steering = self._find_steering_angle_by_color(dashboard)
         if steering == -100.0:
             return {"steering": 5.0, "throttle": -0.3}
-          
+
 
         have_yellow_light = self._light_check(dashboard,self.yellow_light_range)
 
         have_green_light = self._light_check(dashboard,self.green_light_range)
 
-        sys.stderr.write("###  light detection:" +have_green_light +","+ have_yellow_light +"\n")
-        print(green_light)
+        #sys.stderr.write("###  light detection:" +have_green_light +","+ have_yellow_light +"\n")
+        #print(green_light)
 
         if have_yellow_light:
-            steering = 0
-            throttle = 0
+            steering = 0.0
+            throttle = 0.0
         elif have_green_light:
-            throttle = (0.7 - min(abs(steering / 50.0), 0.5)) / 2
+            throttle = (0.7 - min(abs(float(steering) / 50.0), 0.5)) / 2.0
         else:
-            throttle = 0.7 - min(abs(steering / 50.0), 0.5)
+            throttle = 0.7 - min(abs(float(steering) / 50.0), 0.5)
 
         return {"steering": steering, "throttle": throttle}
 
-    
+
     def _find_max_len(self, h_list):
         check_value     = 0
         side_region     = 1
@@ -118,7 +118,7 @@ class TrendCarPilot(AutoPilot):
                             return True
 
         return False
-    
+
     import cv2
 
     def _light_check(self,dashboard,color_range):
@@ -128,11 +128,11 @@ class TrendCarPilot(AutoPilot):
         mask = cv2.inRange(img_hsv,color_range[0],color_range[1] )
         _, contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
-            area = cv2.contourArea(cnt)      
-            if area > 50:        
-                #x, y, w, h = cv2.boundingRect(cnt) 
+            area = cv2.contourArea(cnt)
+            if area > 50:
+                #x, y, w, h = cv2.boundingRect(cnt)
                 hava_light = True
-        return hava_light  
+        return hava_light
 
 
     def _find_steering_angle_by_color(self, dashboard):
