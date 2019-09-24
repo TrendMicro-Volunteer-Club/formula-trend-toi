@@ -8,6 +8,8 @@ import sys
 @AutoPilot.register
 class TrendCarPilot(AutoPilot):
     _track_view_range = (0.5, 0.8)
+    yellow_light_range = [(20, 100, 100),(40, 255, 255)] 
+    green_light_range = [(40, 100, 100),(80, 255, 255)]  
 
 
     def __init__(self):
@@ -27,10 +29,10 @@ class TrendCarPilot(AutoPilot):
         if steering == -100.0:
             return {"steering": 5.0, "throttle": -0.3}
           
-        yellow_light_range = [(20, 100, 100),(40, 255, 255)] 
-        green_light_range = [(40, 100, 100),(80, 255, 255)]  
-        have_yellow_light = light_check(image[0:100, 0:320],yellow_light_range)
-        have_green_light = light_check(image[0:100, 0:320],green_light_range)
+
+        have_yellow_light = self._light_check(dashboard,self.yellow_light_range)
+
+        have_green_light = self._light_check(dashboard,self.green_light_range)
 
         sys.stderr.write("###  light detection:" +have_green_light +","+ have_yellow_light +"\n")
         print(green_light)
@@ -119,7 +121,8 @@ class TrendCarPilot(AutoPilot):
     
     import cv2
 
-    def light_check(img,color_range):
+    def _light_check(self,dashboard,color_range):
+        img = dashboard["frame"][0:100, 0:320]
         hava_light = False
         img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(img_hsv,color_range[0],color_range[1] )
@@ -127,9 +130,8 @@ class TrendCarPilot(AutoPilot):
         for cnt in contours:
             area = cv2.contourArea(cnt)      
             if area > 50:        
-            x, y, w, h = cv2.boundingRect(cnt) 
-            #show(img[y:y + h, x:x + w].copy())    
-            hava_light = True
+                #x, y, w, h = cv2.boundingRect(cnt) 
+                hava_light = True
         return hava_light  
 
 
