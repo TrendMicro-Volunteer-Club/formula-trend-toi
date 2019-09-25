@@ -9,7 +9,7 @@ import sys
 class TrendCarPilot(AutoPilot):
     _track_view_range = (0.5, 0.8)
     yellow_light_range = [(20, 100, 100),(40, 255, 255)]
-    green_light_range = [(40, 100, 100),(80, 255, 255)]
+    green_light_range = [(40, 50, 100),(80, 255, 255)]
 
 
     def __init__(self):
