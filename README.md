@@ -28,7 +28,7 @@ Formula Trend相關範例程式碼、文件、模擬器，以及實體車韌體�
 > 請根據其所運作的平台 (模擬器、實體車) 選取適當的介面進行開發
 
 ### 模擬器
-1. 下載 [模擬器] 並解壓縮
+1. 下載 [模擬器](https://onedrive.live.com/?authkey=%21AJRWp6vIREYo3MU&cid=4D7CA9773D15F70C&id=4D7CA9773D15F70C%21268&parId=4D7CA9773D15F70C%21267&o=OneUp) 並解壓縮
 2. 開啟解壓縮的 `Windows_auto`資料夾
 3. 滑鼠雙擊 `StartGame_local.bat`開啟模擬器
 4. 開啟命令提示字元
