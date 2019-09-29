@@ -30,22 +30,22 @@ class TrendCarPilot(AutoPilot):
             return {"steering": 5.0, "throttle": -0.3}
 
 
-        have_yellow_light = self._light_check(dashboard,self.yellow_light_range)
+        #have_yellow_light = self._light_check(dashboard,self.yellow_light_range)
 
-        have_green_light = self._light_check(dashboard,self.green_light_range)
+        #have_green_light = self._light_check(dashboard,self.green_light_range)
 
         info("###  light detection:" +str(have_green_light) +","+ str(have_yellow_light) +"\n")
         #info(green_light)
 
-        if have_yellow_light:
-            steering = 0.0
-            throttle = 0.0
-        elif have_green_light:
-            throttle = (0.7 - min(abs(float(steering) / 50.0), 0.5)) / 2.0
-        else:
-            throttle = 0.7 - min(abs(float(steering) / 50.0), 0.5)
+        #if have_yellow_light:
+        #    steering = 0.0
+        #    throttle = 0.0
+        #elif have_green_light:
+        #    throttle = (0.7 - min(abs(float(steering) / 50.0), 0.5)) / 2.0
+        #else:
+        throttle = 0.7 - min(abs(float(steering) / 50.0), 0.5)
 
-        return {"steering": steering, "throttle": throttle}
+        return {"steering": steering, "throttle": throttle * 0.5}
 
 
     def _find_max_len(self, h_list):
